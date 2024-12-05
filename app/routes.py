@@ -1,18 +1,29 @@
-from flask import jsonify, request
+from flask import Blueprint, jsonify, request
 from app import app, cursor, conn
+import requests
 import psycopg2
-@app.route('/')
+
+# Define a Blueprint for routes
+api_bp = Blueprint('api', __name__)
+
+# External API for live pricing (CoinGecko)
+COINGECKO_API_URL = "https://api.coingecko.com/api/v3/simple/price"
+
+# Health check endpoint
+@api_bp.route('/')
 def home():
     return jsonify({"message": "Hybrid Trading Bot API is running!"})
 
-@app.route('/users', methods=['GET'])
+# Users endpoints
+@api_bp.route('/users', methods=['GET'])
 def get_users():
     cursor.execute("SELECT * FROM users")
     users = cursor.fetchall()
     user_list = [{"id": row[0], "name": row[1], "email": row[2]} for row in users]
     return jsonify({"users": user_list})
 
-@app.route('/add_user', methods=['POST'])
+
+@api_bp.route('/add_user', methods=['POST'])
 def add_user():
     data = request.json
     name = data.get('name')
@@ -27,17 +38,17 @@ def add_user():
         conn.rollback()
         return jsonify({"status": "error", "message": "Email already exists!"}), 400
 
-@app.route('/add_trade', methods=['POST'])
+@api_bp.route('/add_trade', methods=['POST'])
 def add_trade():
-    print("POST /add_trade route hit")
-    print(conn)  # Debugging: Check if the database connection is live
-    print(cursor)  # Debugging: Check if the cursor is working
     data = request.json
     user_id = data.get('user_id')
     asset = data.get('asset')
     quantity = data.get('quantity')
     trade_type = data.get('trade_type')
     price = data.get('price')
+
+    if trade_type not in ['buy', 'sell']:
+        return jsonify({"status": "error", "message": "Invalid trade type"}), 400
 
     try:
         cursor.execute(
@@ -54,8 +65,63 @@ def add_trade():
         return jsonify({"status": "error", "message": str(e)}), 400
 
 
+@api_bp.route('/portfolio', methods=['GET'])
+def portfolio():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({"status": "error", "message": "User ID is required"}), 400
 
-@app.route('/trades', methods=['GET'])
+    try:
+        # Calculate portfolio holdings based on trades
+        cursor.execute("""
+            SELECT asset, SUM(
+                CASE WHEN trade_type = 'buy' THEN quantity
+                     WHEN trade_type = 'sell' THEN -quantity
+                END
+            ) AS total_quantity
+            FROM trades
+            WHERE user_id = %s
+            GROUP BY asset
+        """, (user_id,))
+        holdings = cursor.fetchall()
+
+        portfolio = {row[0]: float(row[1]) for row in holdings if row[1] > 0}
+
+        # Fetch live prices from CoinGecko
+        asset_symbols = ','.join(portfolio.keys()).lower()
+        response = requests.get(COINGECKO_API_URL, params={
+            "ids": asset_symbols,
+            "vs_currencies": "usd"
+        })
+
+        if response.status_code != 200:
+            return jsonify({"status": "error", "message": "Failed to fetch live prices"}), 500
+
+        prices = response.json()
+
+        # Calculate portfolio value
+        total_value_usd = 0
+        portfolio_with_values = {}
+        for asset, quantity in portfolio.items():
+            asset_key = asset.lower()
+            price = prices.get(asset_key, {}).get("usd", 0)
+            value = price * quantity
+            portfolio_with_values[asset] = {
+                "quantity": quantity,
+                "price_usd": price,
+                "value_usd": value
+            }
+            total_value_usd += value
+
+        return jsonify({
+            "status": "success",
+            "portfolio": portfolio_with_values,
+            "total_value_usd": total_value_usd
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+@api_bp.route('/trades', methods=['GET'])
 def get_trades():
     user_id = request.args.get('user_id')
 
@@ -75,29 +141,5 @@ def get_trades():
             } for row in trades
         ]
         return jsonify({"trades": trade_list})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
-
-
-@app.route('/portfolio', methods=['GET'])
-def portfolio():
-    user_id = request.args.get('user_id')
-
-    try:
-        # Calculate portfolio holdings based on trades
-        cursor.execute("""
-            SELECT asset, SUM(
-                CASE WHEN trade_type = 'buy' THEN quantity
-                     WHEN trade_type = 'sell' THEN -quantity
-                END
-            ) AS total_quantity
-            FROM trades
-            WHERE user_id = %s
-            GROUP BY asset
-        """, (user_id,))
-        holdings = cursor.fetchall()
-
-        portfolio = {row[0]: float(row[1]) for row in holdings if row[1] > 0}
-        return jsonify({"portfolio": portfolio})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
